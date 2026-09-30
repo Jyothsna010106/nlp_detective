@@ -1,0 +1,8 @@
+streamlit>=1.30.0
+spacy>=3.7.0
+pandas>=2.0.0
+networkx>=3.0
+pyvis>=0.3.2
+fpdf2>=2.7.0
+python-dateutil>=2.8.2
+pypdf>=4.0.0

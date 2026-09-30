@@ -1,0 +1,1817 @@
+NLP DETECTIVE PROJECT
+DETAILED TECHNICAL REPORT
+
+Generated: 2026-09-30
+Project root: NLP-detective
+
+======================================================================
+1. EXECUTIVE SUMMARY
+======================================================================
+
+NLP Detective is a local, browser-based forensic investigation workspace
+built with Streamlit. It lets an operative register or authenticate into
+an organization-specific vault, create case files, append evidence from
+manual text or TXT/PDF documents, and run cumulative natural-language
+analysis over the evidence.
+
+The application combines five main capabilities:
+
+1. Local multi-tenant storage using JSON files.
+2. Authentication with SHA-256 password hashes.
+3. Natural-language processing using spaCy.
+4. Relationship and centrality analysis using NetworkX and PyVis.
+5. PDF dossier generation using FPDF2.
+
+A typical investigation works as follows:
+
+    User logs in
+        |
+        v
+    Organization vault is loaded from local_vault/cases/<organization>
+        |
+        v
+    User selects or creates a case
+        |
+        v
+    Evidence is entered manually or extracted from TXT/PDF
+        |
+        v
+    Evidence is saved as JSON
+        |
+        v
+    All evidence text is combined and processed by spaCy
+        |
+        +--> Named entities
+        +--> Subject-verb-object relationships
+        +--> Timeline events
+        +--> Tokens
+        +--> Network graph and centrality ranking
+        +--> Downloadable PDF report
+
+The project is intentionally local. It does not use a database server,
+remote API, cloud authentication service, or external case-management
+backend. Apart from downloading web fonts in the browser and loading
+third-party JavaScript already stored in lib/, the application operates
+on the local machine.
+
+======================================================================
+2. PROJECT STRUCTURE
+======================================================================
+
+Project files:
+
+    app.py
+        Main Streamlit application. Owns the user interface, session
+        state, authentication flow, case selection, evidence ingestion,
+        NLP orchestration, graph embedding, and PDF download button.
+
+    nlp_engine.py
+        NLP processing functions. Loads the spaCy English model, parses
+        documents, normalizes entities, resolves a small set of pronouns,
+        extracts relationship triplets, and extracts dated timeline events.
+
+    storage.py
+        File-system persistence and account functions. Creates the local
+        vault, reads and writes users, sanitizes organization folder names,
+        and saves/loads/deletes case JSON files.
+
+    visualizer.py
+        Converts relationship triplets into a NetworkX directed graph,
+        calculates centrality, selects a primary person/entity of interest,
+        and generates a PyVis HTML graph.
+
+    pdf_generator.py
+        Defines the FPDF dossier layout and generates a PDF containing
+        case metadata, evidence logs, named entities, and relationship
+        triplets.
+
+    requirements.txt
+        Python dependency list.
+
+    local_vault/users.json
+        Local account registry. Password values are SHA-256 hashes, not
+        plaintext passwords.
+
+    local_vault/cases/<organization>/*.json
+        Organization-specific case files.
+
+    lib/bindings/utils.js
+        JavaScript support file bundled with the project.
+
+    lib/tom-select/
+        Bundled Tom Select JavaScript and CSS assets.
+
+    lib/vis-9.1.2/
+        Bundled vis-network CSS and JavaScript assets used by PyVis graphs.
+
+The lib/ directory contains third-party or vendor assets. Those files are
+not application logic and should not be manually edited unless a library
+upgrade or a deliberate frontend dependency change is required.
+
+======================================================================
+3. DEPENDENCIES AND RUNTIME REQUIREMENTS
+======================================================================
+
+The dependency declarations are:
+
+    streamlit>=1.30.0
+    spacy>=3.7.0
+    pandas>=2.0.0
+    networkx>=3.0
+    pyvis>=0.3.2
+    fpdf2>=2.7.0
+    python-dateutil>=2.8.2
+    pypdf>=4.0.0
+
+What each dependency does:
+
+- streamlit
+  Provides the web application UI, widgets, tabs, sidebar, file upload,
+  session state, reruns, and download button.
+
+- spacy
+  Provides tokenization, sentence segmentation, part-of-speech tagging,
+  named entity recognition, dependency parsing, and entity explanations.
+
+- pandas
+  Converts triplet/entity/ranking lists into tables displayed in Streamlit.
+
+- networkx
+  Stores the relationship graph and calculates degree and betweenness
+  centrality.
+
+- pyvis
+  Converts the NetworkX graph into an interactive browser HTML graph.
+
+- fpdf2
+  Creates the downloadable forensic PDF dossier.
+
+- python-dateutil
+  Parses date and time expressions found in evidence.
+
+- pypdf
+  Reads text from uploaded PDF files.
+
+The code requires the spaCy model en_core_web_sm. The model is loaded at
+module import time in nlp_engine.py:
+
+    nlp = spacy.load("en_core_web_sm")
+
+Therefore, a machine can have spaCy installed and still fail to start if
+the model has not been installed. The normal setup is:
+
+    pip install -r requirements.txt
+    python -m spacy download en_core_web_sm
+    streamlit run app.py
+
+On Windows, use the Python interpreter belonging to the project's virtual
+environment if one exists.
+
+======================================================================
+4. APPLICATION ARCHITECTURE
+======================================================================
+
+The architecture is a single-process Streamlit application with imported
+service modules.
+
+UI/orchestration layer:
+
+    app.py
+
+Domain processing layers:
+
+    nlp_engine.py       Text -> NLP structures
+    visualizer.py       Triplets -> graph HTML and rankings
+    pdf_generator.py    Case data -> PDF bytes
+
+Persistence layer:
+
+    storage.py          Python dictionaries <-> JSON files
+
+The main app does not maintain a separate database model. A case is a
+normal Python dictionary loaded from JSON. The current case dictionary is
+modified in memory and written back to disk after changes.
+
+The most important architectural characteristic is cumulative analysis.
+The application does not analyze only the latest evidence entry. It joins
+all non-empty entry text:
+
+    cumulative_text = " ".join([e["text"] for e in entries if e["text".strip()])
+
+That combined text is parsed once during the current Streamlit run. The
+same parsed document feeds entities, triplets, timeline events, tokens,
+the graph, and the PDF report.
+
+======================================================================
+5. APP.PY: MAIN STREAMLIT APPLICATION
+======================================================================
+
+5.1 Imports
+
+The application imports Streamlit and its supporting libraries:
+
+    import streamlit as st
+    import pandas as pd
+    import streamlit.components.v1 as components
+    from datetime import datetime
+    import spacy
+    from pypdf import PdfReader
+    import io
+
+    from storage import (
+        load_users, register_user, authenticate_user,
+        load_org_cases, save_case, delete_case_from_disk, hash_val
+    )
+    from nlp_engine import (
+        parse_document, post_process_entities, extract_triplets,
+        extract_timeline_events
+    )
+    from visualizer import analyze_network_centrality
+    from pdf_generator import generate_pdf_report
+
+The imports reveal the app's responsibilities. Streamlit is the UI shell;
+pandas renders analysis tables; pypdf handles PDF input; storage handles
+persistence; nlp_engine performs language analysis; visualizer creates the
+interactive graph; and pdf_generator creates the export artifact.
+
+5.2 Page configuration
+
+The initial page configuration is:
+
+    st.set_page_config(
+        page_title="NLP Detective | Intelligence Suite",
+        page_icon="...",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+
+The wide layout is important because the application displays four metric
+cards, entity columns, tables, a graph, and a sidebar. The expanded sidebar
+is used as the case archive/navigation surface.
+
+5.3 Visual styling
+
+The app injects a large CSS block using st.markdown(...,
+unsafe_allow_html=True). The visual system defines CSS variables such as:
+
+    :root {
+        --ink: #101315;
+        --paper: #181c1d;
+        --line: rgba(214, 183, 119, 0.22);
+        --muted: #9a9b91;
+        --bone: #e8e0cf;
+        --amber: #d6b777;
+        --signal: #c86b4b;
+    }
+
+The styling is organized around:
+
+- A dark ink background with subtle layered texture.
+- Amber evidence accents.
+- Copper/red primary action buttons.
+- Dark dossier-like content panels.
+- Libre Baskerville for readable report-like text.
+- DM Mono for identifiers, metrics, timestamps, and technical labels.
+- Responsive layout rules for smaller screens.
+
+Important UI selectors include:
+
+    [data-testid="stSidebar"]
+    .hud-header
+    .metric-grid
+    .metric-card
+    .log-entry
+    .timeline-node
+    [data-baseweb="tab-list"]
+    [data-testid="stDataFrame"]
+
+The CSS is presentation-only. It does not change the case logic or NLP
+outputs.
+
+5.4 Session state
+
+Streamlit reruns the script when a widget changes. Session state preserves
+selected values between reruns:
+
+    if "logged_in_user" not in st.session_state:
+        st.session_state.logged_in_user = None
+
+    if "unlocked_cases" not in st.session_state:
+        st.session_state.unlocked_cases = set()
+
+The logged_in_user value determines whether the user has passed
+authentication. unlocked_cases contains case IDs successfully opened with
+their PIN during the current session.
+
+The app also stores current_case_id and display_name after successful
+login. These values are created when authentication succeeds:
+
+    st.session_state.logged_in_user = u_id.strip().lower()
+    st.session_state.display_name = response_msg
+    st.session_state.current_case_id = None
+    st.rerun()
+
+5.5 Authentication gateway
+
+The auth_ui function creates two tabs: secure login and agency enlistment.
+The login section collects a handle and password:
+
+    u_id = st.text_input("Operative Handle", key="login_handle_input")
+    u_pwd = st.text_input(
+        "Security Clearance Key",
+        type="password",
+        key="login_pass_input"
+    )
+
+When the login button is pressed, the app calls storage.authenticate_user:
+
+    if st.button("Access Organization Vault", type="primary", use_container_width=True):
+        is_valid, response_msg = authenticate_user(u_id, u_pwd)
+        if is_valid:
+            st.session_state.logged_in_user = u_id.strip().lower()
+            st.session_state.display_name = response_msg
+            st.session_state.current_case_id = None
+            st.rerun()
+        else:
+            st.error(f"Authentication failed: {response_msg}")
+
+The registration path collects organization name, handle, and password, then
+calls register_user. After successful registration, it logs the new user in
+immediately and reruns the app.
+
+This is a local authentication system. It does not use cookies, JWTs,
+OAuth, or a remote identity provider.
+
+5.6 Loading the current organization
+
+After authentication, the app identifies the current user and loads the
+organization-specific cases:
+
+    cur_agent_key = st.session_state.logged_in_user
+    users_db = load_users()
+    user_info = users_db.get(cur_agent_key, {})
+    cur_agent = user_info.get("display_name", cur_agent_key)
+    cur_org = user_info.get("org", "Unknown Agency")
+    org_cases = load_org_cases(cur_org)
+
+The organization name determines the case directory. Users with different
+organizations see different directories, provided they use the same exact
+organization string after sanitization.
+
+5.7 Creating a case
+
+The create_new_case function constructs a new case dictionary:
+
+    def create_new_case():
+        new_id = f"CASE-{datetime.now().strftime('%y%m%d%H%M%S')}"
+        new_case_obj = {
+            "id": new_id,
+            "title": "New Incident File",
+            "entries": [],
+            "creator": cur_agent,
+            "is_locked": False,
+            "pin_hash": None,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M")
+        }
+        save_case(cur_org, new_id, new_case_obj)
+        st.session_state.current_case_id = new_id
+        st.rerun()
+
+The case ID is based on the current timestamp to the second. The case is
+saved immediately, selected as the active case, and the interface reruns.
+
+5.8 Selecting a default case
+
+If the current case ID is absent or no longer exists, the app chooses the
+first loaded case when available:
+
+    if st.session_state.get("current_case_id") not in org_cases:
+        if org_cases:
+            st.session_state.current_case_id = list(org_cases.keys())[0]
+        else:
+            st.session_state.current_case_id = None
+
+This avoids displaying a blank active workspace when cases exist.
+
+5.9 Sidebar archive
+
+The sidebar displays the operative and organization, provides logout, and
+lists cases. Case buttons show an icon, title, and evidence count:
+
+    num_logs = len(cdata.get("entries", []))
+    if st.button(
+        f"{prefix}{icon} {cdata.get('title', 'Case')[:14]} ({num_logs})",
+        key=f"btn_{cid}",
+        use_container_width=True
+    ):
+        st.session_state.current_case_id = cid
+        st.rerun()
+
+The delete button calls:
+
+    delete_case_from_disk(cur_org, cid)
+
+The sidebar is therefore both navigation and case lifecycle control.
+
+5.10 Empty workspace state
+
+If there is no active case, the app shows an empty vault message and a
+button to initialize the first case. It then stops execution with st.stop()
+so the analysis UI is not rendered without a case.
+
+5.11 Active case header and security
+
+For an active case, the header displays the application name, case ID,
+organization vault, and either OPEN CASE or RESTRICTED.
+
+Locked cases require a PIN before the evidence workspace is shown:
+
+    if active_case.get("is_locked") and (
+        active_id not in st.session_state.unlocked_cases
+    ):
+        st.warning("Encrypted case. Confidential PIN required.")
+        pin_guess = st.text_input(
+            "Security PIN",
+            type="password",
+            key=f"pin_in_{active_id}"
+        )
+        if st.button("Decrypt Dossier", type="primary"):
+            if hash_val(pin_guess) == active_case.get("pin_hash"):
+                st.session_state.unlocked_cases.add(active_id)
+                st.rerun()
+            else:
+                st.error("PIN verification failed.")
+        st.stop()
+
+The PIN is compared as a SHA-256 hash. Once accepted, the case ID is added
+to the current session's unlocked_cases set.
+
+The file security popover can enable or disable the case lock. Enabling it
+hashes the entered PIN and saves both is_locked and pin_hash to the case
+JSON.
+
+5.12 Case title editing
+
+The title is edited through a text input:
+
+    new_title = st.text_input(
+        "Case Designation:",
+        value=active_case.get("title", ""),
+        label_visibility="collapsed"
+    )
+    if new_title != active_case.get("title"):
+        active_case["title"] = new_title
+        save_case(cur_org, active_id, active_case)
+
+Because Streamlit reruns on input changes, this may save as the title is
+changed. The case dictionary is passed directly to save_case.
+
+5.13 Chronological evidence feed
+
+Entries are retrieved from the active case:
+
+    entries = active_case.get("entries", [])
+
+Each entry is rendered with its sequence number, author, timestamp, and
+text. A delete button removes an entry by index:
+
+    entries.pop(idx)
+    active_case["entries"] = entries
+    save_case(cur_org, active_id, active_case)
+    st.rerun()
+
+The application treats the evidence feed as append-oriented, but individual
+entries can be deleted. After deletion, all cumulative analysis is rebuilt
+from the remaining entries.
+
+5.14 TXT and PDF ingestion
+
+The uploader accepts TXT and PDF files:
+
+    uploaded_file = st.file_uploader(
+        "Upload FIR, Interrogation Transcript, or Forensic Report:",
+        type=["txt", "pdf"]
+    )
+
+TXT files are decoded as UTF-8 while ignoring invalid bytes:
+
+    extracted_file_text = uploaded_file.read().decode(
+        "utf-8",
+        errors="ignore"
+    )
+
+PDF files are read page by page using pypdf:
+
+    pdf_reader = PdfReader(io.BytesIO(uploaded_file.read()))
+    for page in pdf_reader.pages:
+        text_content = page.extract_text()
+        if text_content:
+            extracted_file_text += text_content + "\n"
+
+The extracted content is previewed, and the ingest button appends a new
+entry containing the full extracted text:
+
+    entries.append({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "text": extracted_file_text,
+        "author": f"{cur_agent} (via {uploaded_file.name})"
+    })
+    active_case["entries"] = entries
+    save_case(cur_org, active_id, active_case)
+    st.rerun()
+
+PDF text extraction is text-based. Scanned image-only PDFs may produce no
+text unless an OCR step is added in the future.
+
+5.15 Manual evidence entry
+
+Manual evidence uses a text area and a primary button:
+
+    new_evidence = st.text_area(
+        "Log Manual Evidence Update:",
+        placeholder="Type or paste incoming witness statements...",
+        height=85,
+        label_visibility="collapsed",
+        key="new_evidence_input"
+    )
+
+The app prevents adding the exact same text as the immediately previous
+entry:
+
+    clean_text = new_evidence.strip()
+    if clean_text:
+        if entries and entries[-1]["text"].strip() == clean_text:
+            st.warning("This evidence statement was already logged.")
+        else:
+            entries.append({
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "text": clean_text,
+                "author": cur_agent
+            })
+            active_case["entries"] = entries
+            save_case(cur_org, active_id, active_case)
+            st.rerun()
+
+This duplicate check only compares with the latest entry. It does not
+search every historical entry for duplicates.
+
+5.16 Cumulative NLP trigger
+
+Analysis starts only when at least one non-empty evidence entry exists:
+
+    cumulative_text = " ".join([
+        e["text"] for e in entries if e["text".strip()]
+    ])
+
+The text is parsed and transformed:
+
+    if cumulative_text:
+        doc = parse_document(cumulative_text)
+        processed_entities = post_process_entities(doc)
+        triplets = extract_triplets(doc)
+        timeline_events = extract_timeline_events(doc)
+
+The same cumulative document is used throughout the rest of the page.
+
+5.17 Metrics and PDF export
+
+The interface displays cumulative character count, sentence count, entity
+count, and timeline milestone count. It then builds PDF bytes:
+
+    pdf_bytes = generate_pdf_report(
+        case_id=active_id,
+        title=active_case.get("title", "Case"),
+        entries=entries,
+        processed_entities=processed_entities,
+        triplets=triplets,
+        operative=cur_agent,
+        agency=cur_org
+    )
+
+The bytes are exposed through Streamlit:
+
+    st.download_button(
+        label="Export Full Case PDF Dossier",
+        data=pdf_bytes,
+        file_name=f"{active_id}_Dossier.pdf",
+        mime="application/pdf",
+        type="primary"
+    )
+
+5.18 Analysis tabs
+
+The five tabs are:
+
+- Consolidated Dossier
+  Shows entity category cards and S-V-O triplets.
+
+- Incident Timeline
+  Shows normalized date events in chronological order.
+
+- Cumulative Entities
+  Shows mention, type, and spaCy explanation.
+
+- Token Segmentation
+  Shows every spaCy token as a styled token chip.
+
+- Relational Knowledge Graph
+  Shows the interactive PyVis graph, primary entity card, and centrality
+  ranking table.
+
+5.19 Entity category cards
+
+The app divides processed entities into persons, organizations, locations,
+and temporal/value entries:
+
+    people = list(set([
+        e["text"] for e in processed_entities
+        if e["label"] == "PERSON"
+    ]))
+    orgs = list(set([
+        e["text"] for e in processed_entities
+        if e["label"] == "ORG"
+    ]))
+    locs = list(set([
+        e["text"] for e in processed_entities
+        if e["label"] in ("GPE", "FAC")
+    ]))
+    vals = list(set([
+        e["text"] for e in processed_entities
+        if e["label"] in ("DATE", "TIME", "MONEY")
+    ]))
+
+Each category is rendered as a small HTML panel. The use of set removes
+repeated display values but does not change the underlying processed entity
+list.
+
+5.20 Timeline tab
+
+The timeline display loops over sorted timeline events and formats parsed
+dates:
+
+    clean_date_display = (
+        event["parsed_dt"].strftime("%d %B %Y (%A)")
+        if event["parsed_dt"]
+        else event["raw_date"]
+    )
+
+Each event shows a milestone number, date, and original sentence text.
+
+5.21 Entity and token tabs
+
+Entities are converted into table rows:
+
+    records = [
+        {
+            "Mention": e["text"],
+            "Type": e["label"],
+            "Meaning": spacy.explain(e["label"])
+        }
+        for e in processed_entities
+    ]
+
+Tokens are rendered as HTML spans:
+
+    token_pills = "".join([
+        f"<span class='token-chip'>{t.text}</span>"
+        for t in doc
+    ])
+    st.markdown(token_pills, unsafe_allow_html=True)
+
+5.22 Graph tab
+
+The graph tab calls the visualizer:
+
+    g_html, ranked_suspects, top_poi = analyze_network_centrality(
+        triplets,
+        processed_entities
+    )
+
+The returned HTML is embedded into the page:
+
+    components.html(g_html, height=520)
+
+The ranking table is generated from selected fields:
+
+    cols_to_show = [
+        c for c in [
+            "Entity", "Type", "Direct Connections",
+            "Network Role", "Involvement Score"
+        ]
+        if c in ranked_suspects[0]
+    ]
+
+The graph itself is generated outside app.py. app.py is responsible only
+for placing the result into the Streamlit page.
+
+======================================================================
+6. NLP_ENGINE.PY: NATURAL-LANGUAGE PROCESSING
+======================================================================
+
+6.1 Model initialization
+
+The module loads spaCy once when imported:
+
+    import spacy
+    from dateutil import parser as date_parser
+    import re
+
+    nlp = spacy.load("en_core_web_sm")
+
+This gives the module a reusable pipeline object. The model must exist in
+the active Python environment before app.py starts.
+
+6.2 Correction dictionaries
+
+The module contains manually curated correction sets:
+
+    GEO_CORRECTIONS = {
+        "chennai", "hyderabad", "bengaluru", "mumbai", "pune",
+        "delhi", "singapore", "whitefield"
+    }
+
+    PERSON_CORRECTIONS = {
+        "ananya", "ananya sharma", "vikram", "vikram rao",
+        "rahul", "rahul verma", "kavya", "kavya menon",
+        "sameer", "sameer khan"
+    }
+
+    ORG_CORRECTIONS = {
+        "orion", "orion technologies",
+        "orion technologies research centre",
+        "vertex data systems", "nexa digital solutions",
+        "cyber crime investigation bureau",
+        "indian institute of science", "infosys",
+        "apex financial systems"
+    }
+
+These sets supplement spaCy's learned model for known entities. They are
+particularly useful when the project needs consistent labels for recurring
+names and locations.
+
+6.3 parse_document
+
+The parser is intentionally small:
+
+    def parse_document(text: str):
+        return nlp(text)
+
+It returns a spaCy Doc. The Doc contains tokens, sentences, entities,
+part-of-speech tags, dependency relations, and lemmas produced by the
+loaded model.
+
+6.4 post_process_entities
+
+The function normalizes and deduplicates named entities:
+
+    def post_process_entities(doc) -> list[dict]:
+        processed = []
+        seen = set()
+        for ent in doc.ents:
+            txt = ent.text.strip()
+            lower = txt.lower()
+            label = ent.label_
+
+            if lower in ("ip", "the", "an", "a", "pm", "am",
+                         "device", "unknown device"):
+                continue
+
+            if lower in GEO_CORRECTIONS:
+                label = "GPE"
+            elif lower in PERSON_CORRECTIONS:
+                label = "PERSON"
+            elif lower in ORG_CORRECTIONS:
+                label = "ORG"
+
+            key = (txt, label)
+            if key not in seen:
+                seen.add(key)
+                processed.append({"text": txt, "label": label})
+        return processed
+
+Output format:
+
+    [
+        {"text": "Ananya Sharma", "label": "PERSON"},
+        {"text": "Bengaluru", "label": "GPE"}
+    ]
+
+The deduplication key preserves case-sensitive text and normalized label.
+Therefore, two differently capitalized mentions could remain separate if
+they are returned by spaCy as different text values.
+
+6.5 find_contained_entity
+
+This helper finds the first known entity whose text occurs inside another
+string:
+
+    def find_contained_entity(text: str, entities: list[dict]) -> dict:
+        text_lower = text.lower()
+        for ent in entities:
+            if ent["text"].lower() in text_lower:
+                return ent
+        return None
+
+It is used while examining dependency subtrees. For example, if the
+subtree text contains "Ananya Sharma", the helper can associate that text
+with a processed PERSON entity.
+
+6.6 resolve_anaphora
+
+The resolver tracks the latest person and organization across sentences:
+
+    def resolve_anaphora(doc, processed_ents: list[dict]) -> dict[int, str]:
+        resolved_pronouns = {}
+        last_person = None
+        last_org = None
+
+        for sent in doc.sents:
+            for ent in sent.ents:
+                if ent.label_ == "PERSON" or ent.text.lower() in PERSON_CORRECTIONS:
+                    last_person = ent.text
+                elif ent.label_ == "ORG" or ent.text.lower() in ORG_CORRECTIONS:
+                    last_org = ent.text
+
+            for token in sent:
+                token_lower = token.text.lower()
+                if token_lower in ("he", "she", "him", "her", "they") and last_person:
+                    resolved_pronouns[token.i] = last_person
+                elif token_lower in ("it", "company", "firm") and last_org:
+                    resolved_pronouns[token.i] = last_org
+
+        return resolved_pronouns
+
+The result maps spaCy token indexes to concrete entity names. It supports
+simple running antecedent behavior rather than full coreference resolution.
+For example, after a PERSON is mentioned, "he" can be mapped to that
+person until a later person changes the active person.
+
+6.7 extract_triplets
+
+This function converts dependency structures into relationships. Its main
+inputs are the spaCy Doc and the post-processed entities:
+
+    processed_ents = post_process_entities(doc)
+    resolved_pronouns = resolve_anaphora(doc, processed_ents)
+    triplets = []
+
+For each sentence, it examines verbs other than be, have, and do:
+
+    if token.pos_ == "VERB" and token.lemma_.lower() not in (
+        "be", "have", "do"
+    ):
+        action = token.lemma_
+
+It then examines dependency children for subjects and objects. Subject
+roles are found through nsubj and nsubjpass. Object-like targets are found
+through dobj, attr, prep, and pobj. Passive agents are found through the
+agent dependency.
+
+A simplified subject resolution block is:
+
+    for child in token.children:
+        if child.dep_ in ("nsubj", "nsubjpass"):
+            if child.i in resolved_pronouns:
+                source_name = resolved_pronouns[child.i]
+                source_type = "PERSON"
+            else:
+                subtree = "".join([w.text_with_ws for w in child.subtree])
+                cand = find_contained_entity(subtree, sent_ents)
+                if cand:
+                    source_name = cand["text"]
+                    source_type = cand["label"]
+
+Target extraction follows the same general pattern:
+
+    if child.dep_ in ("dobj", "attr", "prep", "pobj"):
+        subtree = "".join([w.text_with_ws for w in child.subtree])
+        cand = find_contained_entity(subtree, sent_ents)
+        if cand:
+            target_name = cand["text"]
+            target_type = cand["label"]
+
+If dependency parsing does not identify both sides but the sentence has at
+least two recognized entities, the function falls back to sentence order:
+
+    if not (source_name and target_name) and len(sent_ents) >= 2:
+        source_name = sent_ents[0]["text"]
+        source_type = sent_ents[0]["label"]
+        target_name = sent_ents[1]["text"]
+        target_type = sent_ents[1]["label"]
+
+The resulting relationship object has this shape:
+
+    {
+        "Subject": source_name,
+        "Relation": action_display,
+        "Object": target_name,
+        "Subject_Type": source_type,
+        "Object_Type": target_type
+    }
+
+Several lemmas are converted into human-readable relations:
+
+    travel   -> TRAVELLED TO
+    meet     -> MET WITH
+    question -> QUESTIONED
+    resign   -> RESIGNED FROM
+    transfer -> TRANSFERRED TO
+    recover  -> RECOVERED FILES AT
+    plug     -> PLUGGED DEVICE INTO
+    download -> DOWNLOADED FILES FROM
+
+Duplicate triplets are not appended twice. The function also rejects
+self-relations where subject and object are the same entity.
+
+Important limitation: this is a targeted forensic extraction heuristic,
+not a general-purpose knowledge graph parser. Dependency parses can vary
+with grammar, punctuation, sentence complexity, and model behavior.
+
+6.8 extract_timeline_events
+
+Timeline extraction searches each sentence for DATE and TIME entities:
+
+    sent_dates = [
+        ent.text for ent in sent.ents
+        if ent.label_ in ("DATE", "TIME")
+    ]
+
+If a date exists, the first date is selected as the primary date. Prefixes
+such as "on", "at", "around", and "approximately" are removed:
+
+    clean_date = re.sub(
+        r'^(on|at|around|approximately)\\s+',
+        '',
+        primary_date_str,
+        flags=re.IGNORECASE
+    )
+
+The dateutil parser attempts fuzzy parsing with a default date:
+
+    parsed_dt = date_parser.parse(
+        clean_date,
+        fuzzy=True,
+        default=date_parser.parse("2026-01-01")
+    )
+
+Each event has this format:
+
+    {
+        "raw_date": primary_date_str,
+        "parsed_dt": parsed_dt,
+        "event": event_text,
+        "sort_key": "YYYY-MM-DD HH:MM"
+    }
+
+Events are sorted by sort_key. Unparseable dates receive a late fallback
+sort key of 9999-99-99, putting them at the end.
+
+======================================================================
+7. STORAGE.PY: LOCAL VAULT AND JSON PERSISTENCE
+======================================================================
+
+7.1 Storage paths
+
+The storage layer defines relative paths:
+
+    VAULT_DIR = "local_vault"
+    USERS_FILE = os.path.join(VAULT_DIR, "users.json")
+    CASES_DIR = os.path.join(VAULT_DIR, "cases")
+
+Because these are relative paths, the process working directory matters.
+The app should be launched from the project root so files resolve under the
+expected local_vault directory.
+
+7.2 Hashing
+
+Passwords and case PIN values are hashed with SHA-256:
+
+    def hash_val(val: str) -> str:
+        return hashlib.sha256(
+            val.strip().encode("utf-8")
+        ).hexdigest()
+
+The input is stripped before hashing. That means leading and trailing
+spaces are not part of a credential. SHA-256 is a one-way hash, but for a
+production security system a slow password hashing algorithm such as Argon2
+or bcrypt would be stronger against offline guessing.
+
+7.3 Directory name sanitization
+
+Organization folder names are made filesystem-safe:
+
+    def sanitize_name(name: str) -> str:
+        return re.sub(
+            r'[^a-zA-Z0-9_-]',
+            '_',
+            name.strip()
+        )
+
+Spaces, ampersands, and other special characters become underscores. The
+original organization string remains in users.json, while the sanitized
+string becomes the directory name.
+
+7.4 Storage initialization
+
+The module initializes storage on import:
+
+    def ensure_storage_ready():
+        os.makedirs(VAULT_DIR, exist_ok=True)
+        os.makedirs(CASES_DIR, exist_ok=True)
+        if not os.path.exists(USERS_FILE):
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump({}, f, indent=4)
+
+    ensure_storage_ready()
+
+This makes the application self-creating for an empty project directory.
+
+7.5 User loading and saving
+
+Users are loaded defensively:
+
+    def load_users() -> dict:
+        ensure_storage_ready()
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    return {}
+                return json.loads(content)
+        except Exception:
+            return {}
+
+Any read or JSON parsing exception returns an empty dictionary. This keeps
+the app from crashing on a malformed users file, but it can also hide data
+corruption from the operator.
+
+Saving uses flush and fsync:
+
+    def save_users(users: dict):
+        ensure_storage_ready()
+        with open(USERS_FILE, "w", encoding="utf-8") as f:
+            json.dump(users, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+The same flush/fsync durability pattern is used for case files.
+
+7.6 User registration
+
+Registration validates required fields and normalizes the handle:
+
+    def register_user(username: str, password: str, org_name: str) -> tuple[bool, str]:
+        users = load_users()
+        u_clean = username.strip().lower()
+
+        if not u_clean or not password.strip() or not org_name.strip():
+            return False, "All verification fields are required."
+
+        if u_clean in users:
+            return False, f"Handle '{username.strip()}' is already registered."
+
+        users[u_clean] = {
+            "display_name": username.strip(),
+            "password": hash_val(password),
+            "org": org_name.strip()
+        }
+        save_users(users)
+        get_org_dir(org_name.strip())
+        return True, "Registration successful."
+
+The dictionary key is lowercase, while display_name preserves the entered
+format. The organization directory is created immediately.
+
+7.7 Authentication
+
+Authentication normalizes the submitted handle, checks existence, hashes
+the submitted password, and compares it to the stored hash:
+
+    def authenticate_user(username: str, password: str) -> tuple[bool, str]:
+        users = load_users()
+        u_clean = username.strip().lower()
+
+        if not u_clean:
+            return False, "Please enter an operative handle."
+
+        if u_clean not in users:
+            return False, "Operative was not found."
+
+        stored_hash = users[u_clean].get("password")
+        if stored_hash == hash_val(password):
+            display_name = users[u_clean].get(
+                "display_name",
+                username.strip()
+            )
+            return True, display_name
+        return False, "Invalid clearance password."
+
+The function returns a boolean and a display message rather than raising
+exceptions for normal authentication failures.
+
+7.8 Organization directories
+
+The directory helper uses the sanitized organization name:
+
+    def get_org_dir(org_name: str) -> str:
+        ensure_storage_ready()
+        path = os.path.join(
+            CASES_DIR,
+            sanitize_name(org_name)
+        )
+        os.makedirs(path, exist_ok=True)
+        return path
+
+7.9 Loading cases
+
+Case files are loaded from an organization directory:
+
+    def load_org_cases(org_name: str) -> dict:
+        org_dir = get_org_dir(org_name)
+        cases = {}
+        for filename in sorted(os.listdir(org_dir)):
+            if filename.endswith(".json"):
+                filepath = os.path.join(org_dir, filename)
+                try:
+                    with open(filepath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        case_id = data.get(
+                            "id",
+                            filename.replace(".json", "")
+                        )
+                        cases[case_id] = data
+                except Exception:
+                    continue
+        return cases
+
+Invalid individual case files are skipped instead of stopping the entire
+application.
+
+7.10 Saving and deleting cases
+
+Saving forces the case ID into the case dictionary and writes the file:
+
+    def save_case(org_name: str, case_id: str, case_data: dict):
+        org_dir = get_org_dir(org_name)
+        filepath = os.path.join(org_dir, f"{case_id}.json")
+        case_data["id"] = case_id
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(case_data, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+
+Deletion is simple file removal:
+
+    def delete_case_from_disk(org_name: str, case_id: str):
+        org_dir = get_org_dir(org_name)
+        filepath = os.path.join(org_dir, f"{case_id}.json")
+        if os.path.exists(filepath):
+            os.remove(filepath)
+
+The case ID is generated internally by the app and is used as the filename.
+
+======================================================================
+8. VISUALIZER.PY: GRAPH AND CENTRALITY ANALYSIS
+======================================================================
+
+8.1 Type themes
+
+TYPE_THEMES maps entity labels to graph colors, icons, shapes, and fonts.
+For example, PERSON uses a copper palette, ORG uses amber, GPE uses green,
+and FAC uses blue-gray. The visual themes are presentation metadata and do
+not affect centrality scores.
+
+A representative theme is:
+
+    "PERSON": {
+        "color": {
+            "background": "#9E5843",
+            "border": "#E5A07C",
+            "highlight": {
+                "background": "#C87858",
+                "border": "#F4DEC3"
+            }
+        },
+        "icon": "person icon",
+        "shape": "box",
+        "font": {
+            "color": "#FFF8EA",
+            "face": "DM Mono",
+            "size": 13,
+            "bold": True
+        }
+    }
+
+8.2 Graph construction
+
+The main function creates a directed NetworkX graph:
+
+    def analyze_network_centrality(
+        triplets: list[dict],
+        processed_entities: list[dict]
+    ) -> tuple[str, list[dict], dict]:
+        G = nx.DiGraph()
+        ent_lookup = {
+            e["text"].lower(): e["label"]
+            for e in processed_entities
+        }
+
+For each triplet, it obtains subject, relation, and object:
+
+    s = t["Subject"]
+    r = t["Relation"]
+    o = t["Object"]
+
+Entity types come from triplet type fields where available, then fall back
+to processed entity lookup:
+
+    s_type = t.get(
+        "Subject_Type",
+        ent_lookup.get(s.lower(), "DEFAULT")
+    )
+    o_type = t.get(
+        "Object_Type",
+        ent_lookup.get(o.lower(), "DEFAULT")
+    )
+
+Nodes include a display label, color theme, margin, border width, shadow,
+and tooltip:
+
+    G.add_node(
+        s,
+        label=f" [icon]  {s} ",
+        shape="box",
+        margin=12,
+        borderWidth=2,
+        shadow={
+            "enabled": True,
+            "color": "rgba(0, 0, 0, 0.45)",
+            "size": 12,
+            "x": 0,
+            "y": 5
+        },
+        color=s_theme["color"],
+        font=s_theme["font"],
+        title=f"Entity: {s} | Classification: {s_type}"
+    )
+
+Edges point from subject to object and carry the relation label:
+
+    G.add_edge(
+        s,
+        o,
+        label=f"  {r}  ",
+        arrows="to",
+        color={
+            "color": "rgba(214, 183, 119, 0.45)",
+            "highlight": "#E5A07C",
+            "hover": "#D6B777"
+        },
+        width=1.5,
+        selectionWidth=2.5,
+        hoverWidth=2
+    )
+
+If there are no nodes, the function returns:
+
+    return "", [], None
+
+8.3 Centrality calculations
+
+The graph is converted to undirected form for connectivity metrics:
+
+    G_undir = G.to_undirected()
+    deg_centrality = nx.degree_centrality(G_undir)
+    bet_centrality = nx.betweenness_centrality(G_undir)
+
+Degree centrality measures how directly connected an entity is. Betweenness
+centrality measures how often an entity lies on shortest paths between other
+entities.
+
+The application combines the metrics:
+
+    inv_score = round(
+        ((deg_score * 0.6) + (bet_score * 0.4)) * 100,
+        1
+    )
+
+The involvement score is therefore a weighted score, not a probability or
+proof of guilt.
+
+Network roles are assigned by thresholds:
+
+    role = (
+        "Key Suspect / Hub"
+        if deg_score >= 0.25
+        else (
+            "Liaison / Broker"
+            if bet_score > 0.1
+            else "Linked Entity"
+        )
+    )
+
+The ranking record is:
+
+    {
+        "Entity": node,
+        "Type": ent_type,
+        "Direct Connections": f"{connection_count} links",
+        "Network Role": role,
+        "Involvement Score": inv_score
+    }
+
+Records are sorted in descending involvement score.
+
+8.4 Primary person/entity of interest
+
+The first PERSON or ORG in the sorted list becomes top_poi. If no person or
+organization exists, the highest-ranked entity is selected:
+
+    top_poi = None
+    for entry in ranked_entities:
+        if entry["Type"] in ("PERSON", "ORG"):
+            top_poi = entry
+            break
+    if not top_poi and ranked_entities:
+        top_poi = ranked_entities[0]
+
+This selection is based on graph metrics and labels. It is an investigative
+lead indicator, not a legal conclusion.
+
+8.5 PyVis rendering
+
+The graph is converted to an interactive PyVis network:
+
+    net = Network(
+        height="520px",
+        width="100%",
+        bgcolor="#141819",
+        font_color="#E8E0CF",
+        directed=True
+    )
+    net.from_nx(G)
+
+The options improve spacing and interaction:
+
+    "physics": {
+        "barnesHut": {
+            "gravitationalConstant": -6200,
+            "centralGravity": 0.12,
+            "springLength": 210,
+            "springConstant": 0.035,
+            "damping": 0.88,
+            "avoidOverlap": 0.9
+        },
+        "minVelocity": 0.5,
+        "solver": "barnesHut",
+        "stabilization": {
+            "enabled": True,
+            "iterations": 180,
+            "fit": True
+        }
+    }
+
+Cubic Bezier edges, arrowheads, hover behavior, zooming, keyboard support,
+and navigation buttons are enabled through the same options JSON.
+
+8.6 HTML generation
+
+PyVis writes a temporary HTML file. The module reads that file into a
+string, removes the temporary file, and returns HTML to Streamlit:
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".html"
+    ) as tmp:
+        net.save_graph(tmp.name)
+        with open(tmp.name, "r", encoding="utf-8") as f:
+            html = f.read()
+    os.remove(tmp.name)
+
+The helper generate_graph_html returns only the HTML:
+
+    def generate_graph_html(triplets, processed_entities) -> str:
+        html, _, _ = analyze_network_centrality(
+            triplets,
+            processed_entities
+        )
+        return html
+
+======================================================================
+9. PDF_GENERATOR.PY: FORENSIC DOSSIER EXPORT
+======================================================================
+
+9.1 PDF subclass
+
+ForensicDossierPDF extends FPDF and defines a common header/footer.
+The header draws a dark full-width band, division title, subtitle, and line:
+
+    class ForensicDossierPDF(FPDF):
+        def header(self):
+            self.set_fill_color(15, 23, 42)
+            self.rect(0, 0, 210, 26, "F")
+            self.set_text_color(56, 189, 248)
+            self.set_font("Helvetica", "B", 13)
+            self.set_xy(12, 6)
+            self.cell(
+                0,
+                7,
+                "CENTRAL FORENSIC LINGUISTICS DIVISION",
+                align="L",
+                new_x="LMARGIN",
+                new_y="NEXT"
+            )
+
+The footer positions a line above agency-vault text and page numbering:
+
+    def footer(self):
+        self.set_y(-16)
+        self.set_draw_color(226, 232, 240)
+        self.set_line_width(0.3)
+        self.line(12, 281, 198, 281)
+        self.set_font("Helvetica", "I", 8)
+        self.cell(90, 8, "RESTRICTED AGENCY VAULT FILE", align="L")
+        self.cell(96, 8, f"Dossier Page {self.page_no()}/{{nb}}", align="R")
+
+9.2 Main report function
+
+The public function is:
+
+    def generate_pdf_report(
+        case_id: str,
+        title: str,
+        entries: list[dict],
+        processed_entities: list[dict],
+        triplets: list[dict],
+        operative: str,
+        agency: str
+    ) -> bytes:
+
+It creates the PDF object, enables total page counts, and starts a page:
+
+    pdf = ForensicDossierPDF()
+    pdf.alias_nb_pages()
+    pdf.add_page()
+
+9.3 Metadata block
+
+The metadata box displays case ID, title, number of local logs, operative,
+and agency. Titles are shortened to 28 characters in the header and agency
+names to 30 characters in the metadata block.
+
+9.4 Evidence section
+
+Evidence entries are printed in chronological list order. The text is
+converted to Latin-1 with replacement to avoid unsupported-character errors
+in the Helvetica font:
+
+    clean_text = entry["text"].encode(
+        "latin-1",
+        "replace"
+    ).decode("latin-1")
+    pdf.multi_cell(186, 5, clean_text)
+
+This is important for Unicode content, but it can replace characters such
+as some currency symbols or non-Latin scripts with a placeholder.
+
+9.5 Entity section
+
+Entities are rendered in a three-column table:
+
+- Entity Mention
+- Classification
+- Context Role
+
+The context role is generated using spaCy:
+
+    spacy.explain(ent["label"])
+
+Rows alternate between white and pale gray fill for readability.
+
+9.6 S-V-O section
+
+Triplets are rendered in a three-column table:
+
+- Source Entity (Subject)
+- Action / Predicate
+- Target / Object Destination
+
+If there are no triplets, the PDF prints a no-triplets message instead of
+leaving an empty table.
+
+9.7 Return value
+
+The final PDF is returned as bytes:
+
+    return bytes(pdf.output())
+
+Streamlit passes these bytes directly to st.download_button.
+
+======================================================================
+10. JSON DATA MODEL
+======================================================================
+
+10.1 User record
+
+A normal user record looks conceptually like this:
+
+    {
+        "display_name": "detective1",
+        "password": "<SHA-256 HASH>",
+        "org": "srinivas detectives"
+    }
+
+Some older records in the current local vault may not have display_name.
+The authentication code has a fallback to the submitted username.
+
+10.2 Case record
+
+A newly created case has this shape:
+
+    {
+        "id": "CASE-260930104507",
+        "title": "New Incident File",
+        "entries": [],
+        "creator": "detective1",
+        "is_locked": false,
+        "pin_hash": null,
+        "created_at": "2026-09-30 10:45"
+    }
+
+A case with evidence has entries like:
+
+    {
+        "timestamp": "2026-09-30 18:12",
+        "text": "Evidence narrative goes here...",
+        "author": "detective1"
+    }
+
+A PDF-ingested entry identifies its source file in the author field:
+
+    "author": "detective1 (via report.pdf)"
+
+10.3 Organization isolation
+
+If the organization is "srinivas detectives", the sanitized directory is:
+
+    local_vault/cases/srinivas_detectives/
+
+If the organization is "Central Intelligence & Forensics Division", the
+sanitized directory is conceptually:
+
+    local_vault/cases/Central_Intelligence___Forensics_Division/
+
+The exact mapping is generated by replacing every character outside
+letters, digits, underscore, and hyphen with an underscore.
+
+10.4 Current sample data
+
+The workspace contains a srinivas_detectives organization with two case
+files. One case contains a long cybersecurity investigation involving
+missing Orion Technologies documents, multiple people, organizations,
+payments, credentials, access cards, and a recovered hard drive. The other
+contains an imported PDF dossier as a single evidence entry.
+
+The bangalore cases directory is currently empty.
+
+For security, this report intentionally does not reproduce live password
+hashes or PIN hashes from local_vault/users.json and case JSON files.
+
+======================================================================
+11. END-TO-END USER WORKFLOWS
+======================================================================
+
+11.1 New user workflow
+
+1. User opens app.py through Streamlit.
+2. storage.py creates local_vault and users.json if missing.
+3. User chooses Agency Enlistment.
+4. User enters organization, handle, and password.
+5. register_user validates values and stores a SHA-256 password hash.
+6. get_org_dir creates the organization case folder.
+7. app.py records the user in session state and reruns.
+8. User sees an empty organization vault.
+9. User initializes the first case.
+
+11.2 Returning user workflow
+
+1. User enters handle and password.
+2. authenticate_user loads users.json.
+3. The submitted password is hashed.
+4. The hash is compared with the stored hash.
+5. The organization is read from the account.
+6. Cases for that organization are loaded.
+7. The first case becomes active if no current case is selected.
+
+11.3 Manual evidence workflow
+
+1. User selects a case.
+2. User types an evidence statement.
+3. The app trims leading/trailing whitespace.
+4. It rejects an exact duplicate of the latest entry.
+5. It appends timestamp, text, and author.
+6. save_case writes the case JSON.
+7. Streamlit reruns.
+8. All evidence is re-analyzed cumulatively.
+
+11.4 File ingestion workflow
+
+1. User uploads TXT or PDF.
+2. TXT is decoded as UTF-8; PDF pages are passed to pypdf.
+3. Extracted text is previewed.
+4. User clicks ingest.
+5. The full text is appended to entries.
+6. The source filename is added to author metadata.
+7. The case is saved and re-analyzed.
+
+11.5 Analysis workflow
+
+1. Evidence entries are joined.
+2. spaCy parses the combined text.
+3. Entity labels are normalized and deduplicated.
+4. Pronouns are resolved using a lightweight running context.
+5. Verb dependencies produce triplets.
+6. Date/time entities produce sorted timeline events.
+7. The UI renders metrics, tables, cards, tokens, and timeline nodes.
+8. Triplets become a graph.
+9. NetworkX calculates centrality.
+10. PyVis produces interactive graph HTML.
+11. FPDF2 prepares the exportable report.
+
+======================================================================
+12. SECURITY AND DATA-INTEGRITY OBSERVATIONS
+======================================================================
+
+Current protections:
+
+- Passwords are not stored as plaintext.
+- Case PINs are stored as hashes.
+- Organization folders are sanitized.
+- Case records are separated by organization directory.
+- JSON writes flush and fsync the file.
+- Locked cases stop the main case UI until the PIN is accepted.
+
+Important limitations:
+
+- SHA-256 alone is not an ideal password hashing scheme for production.
+  A slow salted password hash would be stronger.
+
+- The application is local and does not enforce operating-system file
+  permissions. Anyone with access to the project directory may inspect or
+  modify JSON files.
+
+- JSON writes are not transactional. A process interruption during a write
+  could leave a file incomplete.
+
+- Authentication has no rate limiting or account lockout.
+
+- The application trusts HTML strings rendered with unsafe_allow_html=True.
+  Evidence text is inserted into HTML in several places. If evidence is
+  controlled by an untrusted user, HTML escaping should be added before
+  rendering evidence text.
+
+- Uploaded PDF extraction is not OCR. Image-only PDFs may have no text.
+
+- The graph's involvement score is an analytic heuristic and should not be
+  interpreted as proof or a legal finding.
+
+======================================================================
+13. PERFORMANCE CHARACTERISTICS
+======================================================================
+
+The app reparses the complete cumulative evidence text on each relevant
+Streamlit rerun. For small and medium case files this is simple and clear.
+For very large case histories, the following costs grow with evidence size:
+
+- spaCy parsing time.
+- Entity and sentence iteration.
+- Triplet extraction.
+- Timeline extraction.
+- PDF regeneration.
+- Graph generation and physics stabilization.
+
+The graph uses NetworkX centrality operations. Betweenness centrality can
+be expensive on large graphs. The current project is designed for local
+case-sized documents rather than a high-volume graph database.
+
+Potential future optimizations would include caching parsed documents by a
+content hash, incremental parsing, limiting graph labels, and generating
+the PDF only when the user requests download.
+
+======================================================================
+14. MAINTENANCE GUIDE
+======================================================================
+
+To change the UI theme:
+
+- Edit the CSS block near the beginning of app.py.
+- Preserve Streamlit widget logic below the CSS block.
+
+To change entity colors or graph appearance:
+
+- Edit TYPE_THEMES and PyVis options in visualizer.py.
+- Do not modify centrality formulas unless analytic behavior is intended to
+  change.
+
+To add a supported named entity correction:
+
+- Add the lowercase name to GEO_CORRECTIONS, PERSON_CORRECTIONS, or
+  ORG_CORRECTIONS in nlp_engine.py.
+
+To add a relation display phrase:
+
+- Add a conditional mapping inside extract_triplets in nlp_engine.py.
+
+To change the PDF layout:
+
+- Edit ForensicDossierPDF.header/footer or the relevant report section in
+  pdf_generator.py.
+
+To change account/case persistence:
+
+- Edit storage.py.
+- Maintain compatibility with existing users.json and case JSON records.
+
+To add a new file format:
+
+1. Add its extension to the st.file_uploader type list in app.py.
+2. Add extraction logic in the uploaded-file block.
+3. Keep the resulting value as plain text before appending an entry.
+
+======================================================================
+15. VALIDATION AND TESTING NOTES
+======================================================================
+
+The project currently does not contain a formal tests/ directory. Practical
+checks for the current codebase are:
+
+Syntax checks:
+
+    python -m py_compile app.py
+    python -m py_compile nlp_engine.py
+    python -m py_compile storage.py
+    python -m py_compile visualizer.py
+    python -m py_compile pdf_generator.py
+
+Application launch:
+
+    streamlit run app.py
+
+Graph smoke test concept:
+
+    from visualizer import analyze_network_centrality
+
+    html, ranked, poi = analyze_network_centrality(
+        [
+            {
+                "Subject": "Ananya",
+                "Relation": "MET WITH",
+                "Object": "Orion Technologies",
+                "Subject_Type": "PERSON",
+                "Object_Type": "ORG"
+            }
+        ],
+        [
+            {"text": "Ananya", "label": "PERSON"},
+            {"text": "Orion Technologies", "label": "ORG"}
+        ]
+    )
+
+    assert html
+    assert len(ranked) == 2
+    assert poi["Entity"] == "Ananya"
+
+A useful future test suite would cover:
+
+- Empty and malformed users.json.
+- Registration with missing fields.
+- Duplicate usernames.
+- Correct and incorrect passwords.
+- Organization name sanitization.
+- Case save/load/delete.
+- Entity correction behavior.
+- Pronoun resolution.
+- Triplet extraction.
+- Date parsing and event ordering.
+- Empty graph behavior.
+- Centrality ranking.
+- PDF generation with and without triplets.
+
+======================================================================
+16. CONCLUSION
+======================================================================
+
+NLP Detective is a focused local forensic text-analysis application. Its
+main strength is the direct pipeline from evidence entry to investigative
+artifacts: entities, timeline events, relationships, graph centrality, and
+a PDF dossier. The code is divided into understandable modules, while
+app.py acts as the coordinator that connects user actions to each service.
+
+The most important technical constraints are the local JSON persistence,
+the dependency on the en_core_web_sm spaCy model, the heuristic nature of
+triplet and anaphora extraction, and the cumulative re-analysis performed
+on each rerun. These choices make the project easy to run and understand
+for a local prototype, while also identifying the main areas to strengthen
+for production use.
+
+END OF REPORT
